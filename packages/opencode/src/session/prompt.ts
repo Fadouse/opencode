@@ -20,6 +20,7 @@ import PROMPT_PLAN from "../session/prompt/plan.txt"
 import BUILD_SWITCH from "../session/prompt/build-switch.txt"
 import MAX_STEPS from "../session/prompt/max-steps.txt"
 import { ToolRegistry } from "../tool/registry"
+import { TOOLSEARCH_EXTRA_KEY, type DeferredToolEntry } from "../tool/toolsearch"
 import { MCP } from "../mcp"
 import { LSP } from "../lsp"
 import { FileTime } from "../file/time"
@@ -360,12 +361,41 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         using _ = log.time("resolveTools")
         const tools: Record<string, AITool> = {}
 
+        const toolSearchEnabled = !Flag.OPENCODE_DISABLE_TOOL_SEARCH
+
+        // Tools "loaded" via ToolSearch earlier in this session stay registered
+        // so the model can keep calling them without re-fetching the schema.
+        const discovered = new Set<string>()
+        if (toolSearchEnabled) {
+          for (const m of input.messages) {
+            if (m.info.role !== "assistant") continue
+            for (const p of m.parts) {
+              if (p.type !== "tool" || p.tool !== "toolsearch") continue
+              if (p.state.status !== "completed") continue
+              const matches = (p.state.metadata as { matches?: unknown } | undefined)?.matches
+              if (!Array.isArray(matches)) continue
+              for (const n of matches) if (typeof n === "string") discovered.add(n)
+            }
+          }
+        }
+
+        const deferredTools: Record<string, DeferredToolEntry> = {}
+        const defer = (id: string, description: string, parameters: unknown) => {
+          deferredTools[id] = { description, parameters }
+        }
+        const shouldDefer = (id: string) => toolSearchEnabled && !discovered.has(id)
+
         const context = (args: any, options: ToolExecutionOptions): Tool.Context => ({
           sessionID: input.session.id,
           abort: options.abortSignal!,
           messageID: input.processor.message.id,
           callID: options.toolCallId,
-          extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps },
+          extra: {
+            model: input.model,
+            bypassAgentCheck: input.bypassAgentCheck,
+            promptOps,
+            [TOOLSEARCH_EXTRA_KEY]: deferredTools,
+          },
           agent: input.agent.name,
           messages: input.messages,
           metadata: (val) =>
@@ -398,7 +428,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           providerID: input.model.providerID,
           agent: input.agent,
         })) {
+          if (item.id === "toolsearch" && !toolSearchEnabled) continue
           const schema = ProviderTransform.schema(input.model, z.toJSONSchema(item.parameters))
+
+          if (item.source === "custom" && shouldDefer(item.id)) {
+            defer(item.id, item.description, schema)
+            continue
+          }
           tools[item.id] = tool({
             id: item.id as any,
             description: item.description,
@@ -443,6 +479,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
           const schema = yield* Effect.promise(() => Promise.resolve(asSchema(item.inputSchema).jsonSchema))
           const transformed = ProviderTransform.schema(input.model, schema)
+
+          if (shouldDefer(key)) {
+            defer(key, item.description ?? "", transformed)
+            continue
+          }
+
           item.inputSchema = jsonSchema(transformed)
           item.execute = (args, opts) =>
             run.promise(
@@ -515,7 +557,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           tools[key] = item
         }
 
-        return tools
+        return { tools, deferredToolNames: Object.keys(deferredTools).sort() }
       })
 
       const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
@@ -1339,13 +1381,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const hasToolCalls =
               lastAssistantMsg?.parts.some((part) => part.type === "tool" && !part.metadata?.providerExecuted) ?? false
 
-            if (
-              lastAssistant?.finish &&
-              !["tool-calls"].includes(lastAssistant.finish) &&
-              !hasToolCalls &&
-              lastUser.id < lastAssistant.id
-            ) {
-              yield* slog.info("exiting loop")
+            // Don't special-case finish==='tool-calls': a provider can report it without
+            // emitting any executable tool_use block, and re-entering the loop would replay
+            // the dangling assistant message as prefill (Anthropic OAuth rejects this).
+            if (lastAssistant?.finish && !hasToolCalls && lastUser.id < lastAssistant.id) {
+              yield* slog.info("exiting loop", { finish: lastAssistant.finish })
               break
             }
 
@@ -1425,7 +1465,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
               const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
 
-              const tools = yield* resolveTools({
+              const { tools, deferredToolNames } = yield* resolveTools({
                 agent,
                 session,
                 model,
@@ -1473,6 +1513,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 MessageV2.toModelMessagesEffect(msgs, model),
               ])
               const system = [...env, ...(skills ? [skills] : []), ...instructions]
+              if (deferredToolNames.length > 0) {
+                system.push(
+                  [
+                    "<available-deferred-tools>",
+                    "The following tools are registered but their full schemas are not loaded. Use the `toolsearch` tool to fetch a tool's schema before calling it. Each name below refers to a single tool.",
+                    ...deferredToolNames.map((n) => `- ${n}`),
+                    "</available-deferred-tools>",
+                  ].join("\n"),
+                )
+              }
               const format = lastUser.format ?? { type: "text" as const }
               if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
               const result = yield* handle.process({

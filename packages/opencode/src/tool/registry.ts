@@ -21,6 +21,7 @@ import { Provider } from "../provider/provider"
 import { ProviderID, type ModelID } from "../provider/schema"
 import { WebSearchTool } from "./websearch"
 import { CodeSearchTool } from "./codesearch"
+import { ToolSearchTool } from "./toolsearch"
 import { Flag } from "@/flag/flag"
 import { Log } from "@/util/log"
 import { LspTool } from "./lsp"
@@ -70,7 +71,7 @@ export namespace ToolRegistry {
       providerID: ProviderID
       modelID: ModelID
       agent: Agent.Info
-    }) => Effect.Effect<Tool.Def[]>
+    }) => Effect.Effect<(Tool.Def & { source: "builtin" | "custom" })[]>
   }
 
   export class Service extends Context.Service<Service, Interface>()("@opencode/ToolRegistry") {}
@@ -122,6 +123,7 @@ export namespace ToolRegistry {
       const greptool = yield* GrepTool
       const patchtool = yield* ApplyPatchTool
       const skilltool = yield* SkillTool
+      const toolsearchtool = yield* ToolSearchTool
 
       const state = yield* InstanceState.make<State>(
         Effect.fn("ToolRegistry.state")(function* (ctx) {
@@ -195,6 +197,7 @@ export namespace ToolRegistry {
             search: Tool.init(websearch),
             code: Tool.init(codesearch),
             skill: Tool.init(skilltool),
+            toolsearch: Tool.init(toolsearchtool),
             patch: Tool.init(patchtool),
             question: Tool.init(question),
             lsp: Tool.init(lsptool),
@@ -218,6 +221,7 @@ export namespace ToolRegistry {
               tool.search,
               tool.code,
               tool.skill,
+              tool.toolsearch,
               tool.patch,
               ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [tool.lsp] : []),
               ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [tool.plan] : []),
@@ -272,6 +276,8 @@ export namespace ToolRegistry {
       })
 
       const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+        const s = yield* InstanceState.get(state)
+        const builtinIds = new Set(s.builtin.map((t) => t.id))
         const filtered = (yield* all()).filter((tool) => {
           if (tool.id === CodeSearchTool.id || tool.id === WebSearchTool.id) {
             return input.providerID === ProviderID.opencode || Flag.OPENCODE_ENABLE_EXA
@@ -307,6 +313,7 @@ export namespace ToolRegistry {
               parameters: output.parameters,
               execute: tool.execute,
               formatValidationError: tool.formatValidationError,
+              source: builtinIds.has(tool.id) ? ("builtin" as const) : ("custom" as const),
             }
           }),
           { concurrency: "unbounded" },
@@ -355,7 +362,7 @@ export namespace ToolRegistry {
     providerID: ProviderID
     modelID: ModelID
     agent: Agent.Info
-  }): Promise<(Tool.Def & { id: string })[]> {
+  }): Promise<(Tool.Def & { id: string; source: "builtin" | "custom" })[]> {
     return runPromise((svc) => svc.tools(input))
   }
 }
